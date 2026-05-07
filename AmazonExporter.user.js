@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Amazon Order Exporter
-// @version      0.4.2
+// @version      0.4.3
 // @description  Export Amazon order history to JSON/CSV
 // @author       IeuanK
 // @url          https://github.com/IeuanK/AmazonExporter/raw/main/AmazonExporter.user.js
@@ -253,17 +253,37 @@
                     continue;
                 }
 
-                // Extract total price (€33.98 format)
-                const priceElem = orderHeader.querySelector(".a-column.a-span2 .a-size-base, .yohtmlc-order-total .value");
+                // Locate a field by its caps label (e.g. "Total", "Order placed").
+                // Resilient to column-width changes (a-span2 vs a-span9) that Amazon
+                // ships regionally and over time.
+                const findByLabel = (labelRegex) => {
+                    const labels = orderHeader.querySelectorAll(".a-text-caps");
+                    for (const l of labels) {
+                        if (labelRegex.test(l.textContent.trim())) {
+                            const col = l.closest(".a-column") || l.parentElement?.parentElement;
+                            return col?.querySelector(".a-size-base, .value");
+                        }
+                    }
+                    return null;
+                };
+
+                // Extract total price (£8.75 / €33.98 / $12.00 format)
+                const priceElem =
+                    findByLabel(/^total$/i) ||
+                    orderHeader.querySelector(".yohtmlc-order-total .a-size-base, .yohtmlc-order-total .value, .a-column.a-span2 .a-size-base");
                 if (!priceElem) {
                     throw new Error("Could not find price element");
                 }
                 const priceText = priceElem.textContent.trim();
-                const currency = priceText.startsWith("€") ? "EUR" : "USD";
+                const currency = priceText.startsWith("€") ? "EUR"
+                               : priceText.startsWith("£") ? "GBP"
+                               : "USD";
                 const totalPrice = parseFloat(priceText.replace(/[^0-9.,]/g, "").replace(",", "."));
 
                 // Extract order date
-                const dateElem = orderHeader.querySelector(".a-column.a-span3 .a-size-base, .a-column.a-span3 .value");
+                const dateElem =
+                    findByLabel(/order placed|ordered on/i) ||
+                    orderHeader.querySelector(".a-column.a-span3 .a-size-base, .a-column.a-span3 .value");
                 if (!dateElem) {
                     throw new Error("Could not find date element");
                 }
