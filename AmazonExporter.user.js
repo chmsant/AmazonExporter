@@ -186,6 +186,100 @@
         return parsedDate.toDate(); // Convert to native Date object
     };
 
+    const normalizeItemName = (name) =>
+        name.toLowerCase().replace(/\s+/g, " ").trim();
+
+    const fetchItemPrices = async (orderId) => {
+        try {
+            // Build locale-aware detail URL from current hostname
+            const host = window.location.hostname; // e.g. www.amazon.com, www.amazon.de
+            const url = `https://${host}/your-orders/orders?orderID=${orderId}`;
+
+            const response = await fetch(url, { credentials: "include" });
+            if (!response.ok) {
+                conError(`Detail page fetch failed for ${orderId}: HTTP ${response.status}`);
+                return null;
+            }
+
+            const html = await response.text();
+
+            // Sentinel check — if the orderId isn't in the response, we likely got a
+            // login redirect or error page rather than the actual order detail page.
+            if (!html.includes(orderId)) {
+                conError(`Detail page for ${orderId} appears to be a redirect (no orderId in response)`);
+                return null;
+            }
+
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(html, "text/html");
+
+            // Extract all item containers from the detail page.
+            // NOTE: Detail page selectors differ from listing page. The selectors below
+            // are best-effort and MUST be verified with a live browser session on first use.
+            // If "No item containers found" appears in console, open DevTools on the detail
+            // page and identify the correct container class, then update this selector list.
+            //
+            // Known detail-page container candidates (verify which applies to your locale):
+            //   .yohtmlc-item          — may also appear on detail page
+            //   .a-box.shipment        — shipment-level container (items nested inside)
+            //   .a-row.a-spacing-mini  — individual item rows within shipment boxes
+            const itemContainerSelectors = [
+                ".yohtmlc-item",
+                ".a-box.shipment .a-row",
+                ".a-row.a-spacing-mini",
+            ];
+            let itemContainers = [];
+            for (const sel of itemContainerSelectors) {
+                const found = doc.querySelectorAll(sel);
+                if (found.length) { itemContainers = Array.from(found); break; }
+            }
+            if (!itemContainers.length) {
+                conError(`No item containers found on detail page for ${orderId} — selectors may need updating for this Amazon locale/layout`);
+                return null;
+            }
+
+            // Build name→price map from detail page
+            const priceMap = {};
+            itemContainers.forEach(container => {
+                // Try multiple price selectors in order of reliability
+                let priceText = null;
+                const priceSelectors = [
+                    ".a-price .a-offscreen",
+                    ".a-color-price",
+                    ".a-price-whole",
+                ];
+                for (const sel of priceSelectors) {
+                    const el = container.querySelector(sel);
+                    if (el && el.textContent.trim()) {
+                        priceText = el.textContent.trim();
+                        // For a-price-whole, also grab fraction if present
+                        if (sel === ".a-price-whole") {
+                            const fraction = container.querySelector(".a-price-fraction");
+                            if (fraction) priceText += "." + fraction.textContent.trim();
+                        }
+                        break;
+                    }
+                }
+                if (!priceText) return;
+
+                const price = parseFloat(priceText.replace(/[^0-9.]/g, ""));
+                if (isNaN(price)) return;
+
+                // Get item name from detail page for matching
+                const titleEl = container.querySelector(".yohtmlc-product-title, .a-link-normal");
+                if (!titleEl) return;
+                const name = normalizeItemName(titleEl.textContent.trim());
+                if (name) priceMap[name] = price;
+            });
+
+            conLog(`fetchItemPrices ${orderId}: found ${Object.keys(priceMap).length} prices from ${itemContainers.length} containers`);
+            return priceMap;
+        } catch (e) {
+            conError(`fetchItemPrices error for ${orderId}:`, e);
+            return null;
+        }
+    };
+
     const formatDateFromParts = (part1, part2) => {
         // Check if part1 is the day or the month
         const isPart1Day = !isNaN(parseInt(part1, 10)); // If it's numeric, it's likely the day
