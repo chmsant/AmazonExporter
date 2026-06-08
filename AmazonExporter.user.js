@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Amazon Order Exporter
-// @version      0.4.5
+// @version      0.4.6
 // @description  Export Amazon order history to JSON/CSV
 // @author       IeuanK
 // @url          https://github.com/IeuanK/AmazonExporter/raw/main/AmazonExporter.user.js
@@ -195,96 +195,67 @@
     const normalizeItemName = (name) =>
         name.toLowerCase().replace(/\s+/g, " ").trim();
 
+    const PRICE_CACHE_KEY = "amazonOrderPriceCache";
+
+    // Read cached prices for an order (written by extractAndCachePrices on the detail page).
     const fetchItemPrices = async (orderId) => {
         try {
-            // Build locale-aware detail URL from current hostname
-            const host = window.location.hostname; // e.g. www.amazon.com, www.amazon.de
-            const url = `https://${host}/your-orders/order-details?orderID=${orderId}`;
-
-            const response = await fetch(url, { credentials: "include" });
-            if (!response.ok) {
-                conError(`Detail page fetch failed for ${orderId}: HTTP ${response.status}`);
-                return null;
+            const cache = JSON.parse(localStorage.getItem(PRICE_CACHE_KEY) || "{}");
+            if (cache[orderId] && Object.keys(cache[orderId]).length > 0) {
+                conLog(`fetchItemPrices ${orderId}: using cached prices (${Object.keys(cache[orderId]).length} items)`);
+                return cache[orderId];
             }
-
-            const html = await response.text();
-
-            // Sentinel check — if the orderId isn't in the response, we likely got a
-            // login redirect or error page rather than the actual order detail page.
-            if (!html.includes(orderId)) {
-                conError(`Detail page for ${orderId} appears to be a redirect (no orderId in response)`);
-                return null;
-            }
-
-            const parser = new DOMParser();
-            const doc = parser.parseFromString(html, "text/html");
-
-            // Extract all item containers from the detail page.
-            // NOTE: Detail page selectors differ from listing page. The selectors below
-            // are best-effort and MUST be verified with a live browser session on first use.
-            // If "No item containers found" appears in console, open DevTools on the detail
-            // page and identify the correct container class, then update this selector list.
-            //
-            // Known detail-page container candidates (verify which applies to your locale):
-            //   .yohtmlc-item          — may also appear on detail page
-            //   .a-box.shipment        — shipment-level container (items nested inside)
-            //   .a-row.a-spacing-mini  — individual item rows within shipment boxes
-            const itemContainerSelectors = [
-                ".yohtmlc-item",
-                ".a-box.shipment .a-row",
-                ".a-row.a-spacing-mini",
-            ];
-            let itemContainers = [];
-            for (const sel of itemContainerSelectors) {
-                const found = doc.querySelectorAll(sel);
-                if (found.length) { itemContainers = Array.from(found); break; }
-            }
-            if (!itemContainers.length) {
-                conError(`No item containers found on detail page for ${orderId} — selectors may need updating for this Amazon locale/layout`);
-                return null;
-            }
-
-            // Build name→price map from detail page
-            const priceMap = {};
-            itemContainers.forEach(container => {
-                // Try multiple price selectors in order of reliability
-                let priceText = null;
-                const priceSelectors = [
-                    ".a-price .a-offscreen",
-                    ".a-color-price",
-                    ".a-price-whole",
-                ];
-                for (const sel of priceSelectors) {
-                    const el = container.querySelector(sel);
-                    if (el && el.textContent.trim()) {
-                        priceText = el.textContent.trim();
-                        // For a-price-whole, also grab fraction if present
-                        if (sel === ".a-price-whole") {
-                            const fraction = container.querySelector(".a-price-fraction");
-                            if (fraction) priceText = priceText.replace(/\.$/, "") + "." + fraction.textContent.trim();
-                        }
-                        break;
-                    }
-                }
-                if (!priceText) return;
-
-                const price = parseFloat(priceText.replace(/[^0-9.]/g, ""));
-                if (isNaN(price)) return;
-
-                // Get item name from detail page for matching
-                const titleEl = container.querySelector(".yohtmlc-product-title, .a-link-normal");
-                if (!titleEl) return;
-                const name = normalizeItemName(titleEl.textContent.trim());
-                if (name) priceMap[name] = price;
-            });
-
-            const matchCount = Object.keys(priceMap).length;
-            conLog(`fetchItemPrices ${orderId}: found ${matchCount} prices from ${itemContainers.length} containers`);
-            return matchCount > 0 ? priceMap : null;
         } catch (e) {
-            conError(`fetchItemPrices error for ${orderId}:`, e);
-            return null;
+            conError("fetchItemPrices: cache read error", e);
         }
+        conLog(`fetchItemPrices ${orderId}: no cached prices — visit the order detail page to cache item prices`);
+        return null;
+    };
+
+    // Runs on /your-orders/order-details pages. Polls for JS-rendered item rows,
+    // extracts name→price pairs, and stores them in localStorage for use during capture.
+    const extractAndCachePrices = () => {
+        const orderId = new URLSearchParams(window.location.search).get("orderID");
+        if (!orderId) return;
+
+        let attempts = 0;
+        const maxAttempts = 20; // 10 seconds total
+        const interval = setInterval(() => {
+            attempts++;
+            const containers = document.querySelectorAll(".a-row.a-spacing-mini");
+            if (containers.length || attempts >= maxAttempts) {
+                clearInterval(interval);
+                if (!containers.length) {
+                    conError(`extractAndCachePrices: no item containers found for ${orderId} after ${attempts} attempts`);
+                    return;
+                }
+                const priceMap = {};
+                containers.forEach(container => {
+                    const titleEl = container.querySelector(".yohtmlc-product-title, .a-link-normal");
+                    if (!titleEl) return;
+                    const name = normalizeItemName(titleEl.textContent.trim());
+
+                    const priceEl = container.querySelector(".a-price .a-offscreen, .a-color-price");
+                    if (!priceEl) return;
+                    const price = parseFloat(priceEl.textContent.trim().replace(/[^0-9.]/g, ""));
+                    if (!isNaN(price) && name) priceMap[name] = price;
+                });
+
+                const count = Object.keys(priceMap).length;
+                if (count > 0) {
+                    try {
+                        const cache = JSON.parse(localStorage.getItem(PRICE_CACHE_KEY) || "{}");
+                        cache[orderId] = priceMap;
+                        localStorage.setItem(PRICE_CACHE_KEY, JSON.stringify(cache));
+                        conLog(`extractAndCachePrices: cached ${count} item prices for order ${orderId}`);
+                    } catch (e) {
+                        conError("extractAndCachePrices: failed to write cache", e);
+                    }
+                } else {
+                    conError(`extractAndCachePrices: found containers but no name+price pairs for ${orderId}`);
+                }
+            }
+        }, 500);
     };
 
     const formatDateFromParts = (part1, part2) => {
@@ -912,7 +883,11 @@
     };
 
     conLog(`Checking URL`);
-    // Check if we're on an orders page
+    // On order detail pages: silently cache item prices for use during listing-page capture
+    if (window.location.href.match(/\/your-orders\/order-details/)) {
+        extractAndCachePrices();
+    }
+    // Check if we're on an orders listing page
     if (
         window.location.href.match(/\/your-orders\/orders/) ||
         window.location.href.match(/\/order-history/)
