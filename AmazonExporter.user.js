@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Amazon Order Exporter
-// @version      0.4.10
+// @version      0.4.11
 // @description  Export Amazon order history to JSON/CSV
 // @author       IeuanK
 // @url          https://github.com/IeuanK/AmazonExporter/raw/main/AmazonExporter.user.js
@@ -197,186 +197,143 @@
 
     const PRICE_CACHE_KEY = "amazonOrderPriceCache";
 
-    // Shared popup window reused across all orders in one capture run.
+    // Shared popup window reused across all orders in one capture run (popup fallback only).
     let _priceWindow = null;
 
-    // Open the detail page in a popup tab. The userscript runs in that tab too and calls
-    // extractAndCachePrices(), which writes name→price pairs to localStorage. The opener
-    // polls localStorage until the entry appears, then resolves. No cross-frame DOM access.
-    // Falls back to null if the popup is blocked or prices don't cache within 20s.
-    const fetchItemPrices = (orderId) => {
-        return new Promise((resolve) => {
-            // Serve from cache when available (skip _pending entries — those are mid-flight)
-            try {
-                const cache = JSON.parse(localStorage.getItem(PRICE_CACHE_KEY) || "{}");
-                const entry = cache[orderId];
-                if (entry && !entry._pending && Object.keys(entry).length > 0) {
-                    conLog(`fetchItemPrices ${orderId}: cached (${Object.keys(entry).length} items)`);
-                    return resolve(entry);
-                }
-            } catch (e) { /* ignore */ }
+    // Extract name→price map from a parsed HTML document using the order detail page structure.
+    // Selectors verified against live Amazon order detail page HTML.
+    const extractPricesFromDoc = (doc) => {
+        const priceMap = {};
+        const containers = doc.querySelectorAll("[data-component='purchasedItems'] .a-row.a-spacing-top-base");
+        containers.forEach(container => {
+            const titleEl = container.querySelector("[data-component='itemTitle'] a.a-link-normal");
+            const priceEl = container.querySelector("[data-component='unitPrice'] .a-offscreen");
+            if (!titleEl || !priceEl) return;
+            const name = normalizeItemName(titleEl.textContent.trim());
+            const price = parseFloat(priceEl.textContent.trim().replace(/[^0-9.]/g, ""));
+            if (!isNaN(price) && name) priceMap[name] = price;
+        });
+        return priceMap;
+    };
 
-            const host = window.location.hostname;
-            const url = `https://${host}/your-orders/order-details?orderID=${orderId}`;
+    const savePriceCache = (orderId, priceMap) => {
+        try {
+            const cache = JSON.parse(localStorage.getItem(PRICE_CACHE_KEY) || "{}");
+            cache[orderId] = priceMap;
+            localStorage.setItem(PRICE_CACHE_KEY, JSON.stringify(cache));
+        } catch (e) { /* ignore */ }
+    };
 
-            // Reuse the named popup — window.open() on an existing named window navigates it
-            // rather than opening a new one, so only one popup permission is needed per capture.
-            _priceWindow = window.open(url, "amazonPriceLookup", "width=900,height=700,left=50,top=50");
-
-            if (!_priceWindow) {
-                conError(`fetchItemPrices ${orderId}: popup was blocked — allow popups from amazon.com and retry`);
-                return resolve(null);
+    // Fetch the order detail page and extract item prices.
+    // Primary strategy: fetch() — works if Amazon serves content server-side.
+    // Fallback: popup window (Tampermonkey runs extractAndCachePrices in the popup tab,
+    //   which writes to localStorage; opener polls until the entry appears).
+    const fetchItemPrices = async (orderId) => {
+        // Serve from cache when available
+        try {
+            const cache = JSON.parse(localStorage.getItem(PRICE_CACHE_KEY) || "{}");
+            const entry = cache[orderId];
+            if (entry && Object.keys(entry).length > 0) {
+                conLog(`fetchItemPrices ${orderId}: cached (${Object.keys(entry).length} items)`);
+                return entry;
             }
+        } catch (e) { /* ignore */ }
 
+        const host = window.location.hostname;
+        const detailUrl = `https://${host}/your-orders/order-details?orderID=${orderId}`;
+
+        // Strategy 1: fetch() the detail page — no popup needed if content is server-rendered
+        try {
+            const response = await fetch(detailUrl, { credentials: "include" });
+            if (response.ok) {
+                const html = await response.text();
+                if (html.includes(orderId)) {
+                    const doc = new DOMParser().parseFromString(html, "text/html");
+                    const priceMap = extractPricesFromDoc(doc);
+                    if (Object.keys(priceMap).length > 0) {
+                        savePriceCache(orderId, priceMap);
+                        conLog(`fetchItemPrices ${orderId}: ${Object.keys(priceMap).length} prices via fetch`);
+                        return priceMap;
+                    }
+                    conLog(`fetchItemPrices ${orderId}: fetch returned no prices (JS-rendered) — trying popup`);
+                } else {
+                    conLog(`fetchItemPrices ${orderId}: orderId not in fetch response (redirect?) — trying popup`);
+                }
+            } else {
+                conLog(`fetchItemPrices ${orderId}: fetch HTTP ${response.status} — trying popup`);
+            }
+        } catch (e) {
+            conLog(`fetchItemPrices ${orderId}: fetch error (${e.message}) — trying popup`);
+        }
+
+        // Strategy 2: popup tab — Tampermonkey runs extractAndCachePrices in the tab,
+        // which writes prices to localStorage using the same selectors.
+        _priceWindow = window.open(detailUrl, "amazonPriceLookup", "width=900,height=700,left=50,top=50");
+        if (!_priceWindow) {
+            conError(`fetchItemPrices ${orderId}: popup blocked — allow popups from amazon.com and retry`);
+            return null;
+        }
+
+        return new Promise((resolve) => {
             let attempts = 0;
-            const maxAttempts = 40; // 20 seconds at 500ms intervals
-            let scriptConfirmed = false; // true once popup's _pending ping appears
+            const maxAttempts = 40; // 20 seconds at 500ms
 
-            // Poll localStorage — the userscript running in the popup writes the cache entry.
-            // _pending:true means the popup script started but hasn't finished yet.
-            // A real priceMap (no _pending key) means extraction is complete.
             const poll = setInterval(() => {
                 attempts++;
                 try {
                     const cache = JSON.parse(localStorage.getItem(PRICE_CACHE_KEY) || "{}");
                     const entry = cache[orderId];
-                    if (entry) {
-                        if (entry._pending) {
-                            // Script is running in popup — reset timeout counter
-                            if (!scriptConfirmed) {
-                                scriptConfirmed = true;
-                                conLog(`fetchItemPrices ${orderId}: popup script confirmed running`);
-                            }
-                            attempts = 0; // reset — give it the full 20s from when script started
-                            return;
-                        }
-                        // Real price data written
+                    if (entry && Object.keys(entry).length > 0) {
                         clearInterval(poll);
-                        const count = Object.keys(entry).length;
-                        conLog(`fetchItemPrices ${orderId}: ${count} prices via popup→localStorage`);
-                        resolve(count > 0 ? entry : null);
+                        conLog(`fetchItemPrices ${orderId}: ${Object.keys(entry).length} prices via popup→localStorage`);
+                        resolve(entry);
                         return;
                     }
                 } catch (e) { /* ignore */ }
 
                 if (attempts >= maxAttempts) {
                     clearInterval(poll);
-                    if (!scriptConfirmed) {
-                        conError(`fetchItemPrices ${orderId}: popup script did not run — check that Tampermonkey is active on order-details pages`);
-                    } else {
-                        conError(`fetchItemPrices ${orderId}: popup script ran but timed out extracting prices`);
-                    }
+                    conError(`fetchItemPrices ${orderId}: popup timed out — unitPrice will be null`);
                     resolve(null);
                 }
             }, 500);
         });
     };
 
-    // Runs on /your-orders/order-details pages. Polls for JS-rendered item rows,
-    // extracts name→price pairs, and stores them in localStorage for use during capture.
+    // Runs on /your-orders/order-details pages (popup fallback path).
+    // Polls for JS-rendered item containers, extracts prices using verified selectors,
+    // and writes the name→price map to localStorage for the opener to read.
     const extractAndCachePrices = () => {
         const orderId = new URLSearchParams(window.location.search).get("orderID");
         if (!orderId) return;
 
         conLog(`extractAndCachePrices: starting for ${orderId}`);
 
-        // Write a startup ping so the opener can confirm this script is running in the popup
-        try {
-            const cache = JSON.parse(localStorage.getItem(PRICE_CACHE_KEY) || "{}");
-            if (!cache[orderId]) {
-                cache[orderId] = { _pending: true };
-                localStorage.setItem(PRICE_CACHE_KEY, JSON.stringify(cache));
-            }
-        } catch (e) { /* ignore */ }
-
         let attempts = 0;
         const maxAttempts = 20; // 10 seconds total
 
-        // Try to extract a name→price map from item containers on the detail page.
-        // Returns {} if containers exist but yield no pairs (logs why).
-        // Returns null if no containers found at all.
-        const tryExtract = () => {
-            // Strategy 1: look inside .a-row.a-spacing-mini containers
-            const containers = document.querySelectorAll(".a-row.a-spacing-mini");
-            if (containers.length) {
-                const priceMap = {};
-                containers.forEach((container, i) => {
-                    const titleEl = container.querySelector(".yohtmlc-product-title, .a-link-normal, a[href*='/dp/']");
-                    const priceEl = container.querySelector(".a-price .a-offscreen, .a-price-whole, .a-color-price");
-                    conLog(`  container[${i}]: title="${titleEl ? titleEl.textContent.trim().substring(0, 60) : "none"}" price="${priceEl ? priceEl.textContent.trim() : "none"}"`);
-                    if (!titleEl || !priceEl) return;
-                    const name = normalizeItemName(titleEl.textContent.trim());
-                    let priceText = priceEl.textContent.trim();
-                    if (priceEl.classList.contains("a-price-whole")) {
-                        const frac = container.querySelector(".a-price-fraction");
-                        if (frac) priceText = priceText.replace(/\.$/, "") + "." + frac.textContent.trim();
-                    }
-                    const price = parseFloat(priceText.replace(/[^0-9.]/g, ""));
-                    if (!isNaN(price) && name) priceMap[name] = price;
-                });
-                if (Object.keys(priceMap).length > 0) return priceMap;
-
-                // Strategy 2: global title+price pairing (positional) when nested fails
-                conLog(`  nested extraction found 0 pairs — trying global positional match`);
-                const globalTitles = Array.from(document.querySelectorAll(".yohtmlc-product-title, a[href*='/dp/']"))
-                    .filter(el => el.textContent.trim().length > 10);
-                const globalPrices = Array.from(document.querySelectorAll(".a-price .a-offscreen"))
-                    .map(el => parseFloat(el.textContent.trim().replace(/[^0-9.]/g, "")))
-                    .filter(p => !isNaN(p) && p > 0);
-                conLog(`  global titles: ${globalTitles.length}, global prices: ${globalPrices.length}`);
-                if (globalTitles.length > 0 && globalPrices.length > 0 && globalTitles.length === globalPrices.length) {
-                    const positionalMap = {};
-                    globalTitles.forEach((el, i) => {
-                        const name = normalizeItemName(el.textContent.trim());
-                        if (name) positionalMap[name] = globalPrices[i];
-                    });
-                    if (Object.keys(positionalMap).length > 0) return positionalMap;
-                }
-                return {}; // containers found but no pairs
-            }
-            return null; // no containers
-        };
-
         const interval = setInterval(() => {
             attempts++;
-            const result = tryExtract();
-
-            if (result === null) {
-                // No containers yet — keep waiting
+            // Wait for the purchasedItems component to render
+            const containers = document.querySelectorAll("[data-component='purchasedItems'] .a-row.a-spacing-top-base");
+            if (!containers.length) {
                 if (attempts >= maxAttempts) {
                     clearInterval(interval);
                     conError(`extractAndCachePrices: no item containers found for ${orderId} after ${attempts} attempts`);
-                    conLog(`  Page title: "${document.title}"`);
-                    conLog(`  .a-price elements anywhere: ${document.querySelectorAll(".a-price").length}`);
-                    // Clear the pending ping so the opener doesn't wait indefinitely
-                    try {
-                        const cache = JSON.parse(localStorage.getItem(PRICE_CACHE_KEY) || "{}");
-                        if (cache[orderId] && cache[orderId]._pending) delete cache[orderId];
-                        localStorage.setItem(PRICE_CACHE_KEY, JSON.stringify(cache));
-                    } catch (e) { /* ignore */ }
                 }
                 return;
             }
 
             clearInterval(interval);
-            const count = Object.keys(result).length;
+            const priceMap = extractPricesFromDoc(document);
+            const count = Object.keys(priceMap).length;
+            conLog(`extractAndCachePrices: ${count} prices found for ${orderId}`);
+
             if (count > 0) {
-                try {
-                    const cache = JSON.parse(localStorage.getItem(PRICE_CACHE_KEY) || "{}");
-                    cache[orderId] = result;
-                    localStorage.setItem(PRICE_CACHE_KEY, JSON.stringify(cache));
-                    conLog(`extractAndCachePrices: cached ${count} item prices for order ${orderId}`);
-                } catch (e) {
-                    conError("extractAndCachePrices: failed to write cache", e);
-                }
+                savePriceCache(orderId, priceMap);
+                conLog(`extractAndCachePrices: cached ${count} item prices for order ${orderId}`);
             } else {
-                conError(`extractAndCachePrices: found containers but no name+price pairs for ${orderId}`);
-                // Clear pending ping
-                try {
-                    const cache = JSON.parse(localStorage.getItem(PRICE_CACHE_KEY) || "{}");
-                    if (cache[orderId] && cache[orderId]._pending) delete cache[orderId];
-                    localStorage.setItem(PRICE_CACHE_KEY, JSON.stringify(cache));
-                } catch (e) { /* ignore */ }
+                conError(`extractAndCachePrices: containers found but no name+price pairs for ${orderId}`);
             }
         }, 500);
     };
