@@ -199,7 +199,7 @@
         try {
             // Build locale-aware detail URL from current hostname
             const host = window.location.hostname; // e.g. www.amazon.com, www.amazon.de
-            const url = `https://${host}/your-orders/orders?orderID=${orderId}`;
+            const url = `https://${host}/your-orders/order-details?orderID=${orderId}`;
 
             const response = await fetch(url, { credentials: "include" });
             if (!response.ok) {
