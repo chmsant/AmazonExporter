@@ -458,11 +458,27 @@
                         const itemDetails = getItemDetails(itemBox);
                         items.push({
                             ...itemDetails,
+                            unitPrice: null,
                             status: status || "Old",
                             statusDate: formattedStatusDate,
                         });
                     });
                 });
+
+                // Enrich items with per-unit prices for multi-item orders only
+                if (items.length > 1) {
+                    const priceMap = await fetchItemPrices(orderId);
+                    if (priceMap) {
+                        items.forEach(item => {
+                            const key = normalizeItemName(item.name);
+                            if (key in priceMap) item.unitPrice = priceMap[key];
+                        });
+                    }
+                    // 300ms delay between detail fetches to reduce bot-detection risk
+                    await new Promise(resolve => setTimeout(resolve, 300));
+                } else if (items.length === 1) {
+                    items[0].unitPrice = totalPrice;
+                }
 
                 newOrders[orderId] = {
                     orderId: orderId,
