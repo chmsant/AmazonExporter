@@ -255,7 +255,7 @@
                         // For a-price-whole, also grab fraction if present
                         if (sel === ".a-price-whole") {
                             const fraction = container.querySelector(".a-price-fraction");
-                            if (fraction) priceText += "." + fraction.textContent.trim();
+                            if (fraction) priceText = priceText.replace(/\.$/, "") + "." + fraction.textContent.trim();
                         }
                         break;
                     }
@@ -272,8 +272,9 @@
                 if (name) priceMap[name] = price;
             });
 
-            conLog(`fetchItemPrices ${orderId}: found ${Object.keys(priceMap).length} prices from ${itemContainers.length} containers`);
-            return priceMap;
+            const matchCount = Object.keys(priceMap).length;
+            conLog(`fetchItemPrices ${orderId}: found ${matchCount} prices from ${itemContainers.length} containers`);
+            return matchCount > 0 ? priceMap : null;
         } catch (e) {
             conError(`fetchItemPrices error for ${orderId}:`, e);
             return null;
