@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Amazon Order Exporter
-// @version      0.4.9
+// @version      0.4.10
 // @description  Export Amazon order history to JSON/CSV
 // @author       IeuanK
 // @url          https://github.com/IeuanK/AmazonExporter/raw/main/AmazonExporter.user.js
@@ -206,12 +206,13 @@
     // Falls back to null if the popup is blocked or prices don't cache within 20s.
     const fetchItemPrices = (orderId) => {
         return new Promise((resolve) => {
-            // Serve from cache when available
+            // Serve from cache when available (skip _pending entries — those are mid-flight)
             try {
                 const cache = JSON.parse(localStorage.getItem(PRICE_CACHE_KEY) || "{}");
-                if (cache[orderId] && Object.keys(cache[orderId]).length > 0) {
-                    conLog(`fetchItemPrices ${orderId}: cached (${Object.keys(cache[orderId]).length} items)`);
-                    return resolve(cache[orderId]);
+                const entry = cache[orderId];
+                if (entry && !entry._pending && Object.keys(entry).length > 0) {
+                    conLog(`fetchItemPrices ${orderId}: cached (${Object.keys(entry).length} items)`);
+                    return resolve(entry);
                 }
             } catch (e) { /* ignore */ }
 
@@ -229,23 +230,42 @@
 
             let attempts = 0;
             const maxAttempts = 40; // 20 seconds at 500ms intervals
+            let scriptConfirmed = false; // true once popup's _pending ping appears
 
-            // Poll localStorage — the userscript running in the popup writes the cache entry
+            // Poll localStorage — the userscript running in the popup writes the cache entry.
+            // _pending:true means the popup script started but hasn't finished yet.
+            // A real priceMap (no _pending key) means extraction is complete.
             const poll = setInterval(() => {
                 attempts++;
                 try {
                     const cache = JSON.parse(localStorage.getItem(PRICE_CACHE_KEY) || "{}");
-                    if (cache[orderId] && Object.keys(cache[orderId]).length > 0) {
+                    const entry = cache[orderId];
+                    if (entry) {
+                        if (entry._pending) {
+                            // Script is running in popup — reset timeout counter
+                            if (!scriptConfirmed) {
+                                scriptConfirmed = true;
+                                conLog(`fetchItemPrices ${orderId}: popup script confirmed running`);
+                            }
+                            attempts = 0; // reset — give it the full 20s from when script started
+                            return;
+                        }
+                        // Real price data written
                         clearInterval(poll);
-                        conLog(`fetchItemPrices ${orderId}: ${Object.keys(cache[orderId]).length} prices via popup→localStorage`);
-                        resolve(cache[orderId]);
+                        const count = Object.keys(entry).length;
+                        conLog(`fetchItemPrices ${orderId}: ${count} prices via popup→localStorage`);
+                        resolve(count > 0 ? entry : null);
                         return;
                     }
                 } catch (e) { /* ignore */ }
 
                 if (attempts >= maxAttempts) {
                     clearInterval(poll);
-                    conError(`fetchItemPrices ${orderId}: timed out waiting for popup to cache prices`);
+                    if (!scriptConfirmed) {
+                        conError(`fetchItemPrices ${orderId}: popup script did not run — check that Tampermonkey is active on order-details pages`);
+                    } else {
+                        conError(`fetchItemPrices ${orderId}: popup script ran but timed out extracting prices`);
+                    }
                     resolve(null);
                 }
             }, 500);
@@ -258,42 +278,105 @@
         const orderId = new URLSearchParams(window.location.search).get("orderID");
         if (!orderId) return;
 
+        conLog(`extractAndCachePrices: starting for ${orderId}`);
+
+        // Write a startup ping so the opener can confirm this script is running in the popup
+        try {
+            const cache = JSON.parse(localStorage.getItem(PRICE_CACHE_KEY) || "{}");
+            if (!cache[orderId]) {
+                cache[orderId] = { _pending: true };
+                localStorage.setItem(PRICE_CACHE_KEY, JSON.stringify(cache));
+            }
+        } catch (e) { /* ignore */ }
+
         let attempts = 0;
         const maxAttempts = 20; // 10 seconds total
-        const interval = setInterval(() => {
-            attempts++;
-            const containers = document.querySelectorAll(".a-row.a-spacing-mini");
-            if (containers.length || attempts >= maxAttempts) {
-                clearInterval(interval);
-                if (!containers.length) {
-                    conError(`extractAndCachePrices: no item containers found for ${orderId} after ${attempts} attempts`);
-                    return;
-                }
-                const priceMap = {};
-                containers.forEach(container => {
-                    const titleEl = container.querySelector(".yohtmlc-product-title, .a-link-normal");
-                    if (!titleEl) return;
-                    const name = normalizeItemName(titleEl.textContent.trim());
 
-                    const priceEl = container.querySelector(".a-price .a-offscreen, .a-color-price");
-                    if (!priceEl) return;
-                    const price = parseFloat(priceEl.textContent.trim().replace(/[^0-9.]/g, ""));
+        // Try to extract a name→price map from item containers on the detail page.
+        // Returns {} if containers exist but yield no pairs (logs why).
+        // Returns null if no containers found at all.
+        const tryExtract = () => {
+            // Strategy 1: look inside .a-row.a-spacing-mini containers
+            const containers = document.querySelectorAll(".a-row.a-spacing-mini");
+            if (containers.length) {
+                const priceMap = {};
+                containers.forEach((container, i) => {
+                    const titleEl = container.querySelector(".yohtmlc-product-title, .a-link-normal, a[href*='/dp/']");
+                    const priceEl = container.querySelector(".a-price .a-offscreen, .a-price-whole, .a-color-price");
+                    conLog(`  container[${i}]: title="${titleEl ? titleEl.textContent.trim().substring(0, 60) : "none"}" price="${priceEl ? priceEl.textContent.trim() : "none"}"`);
+                    if (!titleEl || !priceEl) return;
+                    const name = normalizeItemName(titleEl.textContent.trim());
+                    let priceText = priceEl.textContent.trim();
+                    if (priceEl.classList.contains("a-price-whole")) {
+                        const frac = container.querySelector(".a-price-fraction");
+                        if (frac) priceText = priceText.replace(/\.$/, "") + "." + frac.textContent.trim();
+                    }
+                    const price = parseFloat(priceText.replace(/[^0-9.]/g, ""));
                     if (!isNaN(price) && name) priceMap[name] = price;
                 });
+                if (Object.keys(priceMap).length > 0) return priceMap;
 
-                const count = Object.keys(priceMap).length;
-                if (count > 0) {
+                // Strategy 2: global title+price pairing (positional) when nested fails
+                conLog(`  nested extraction found 0 pairs — trying global positional match`);
+                const globalTitles = Array.from(document.querySelectorAll(".yohtmlc-product-title, a[href*='/dp/']"))
+                    .filter(el => el.textContent.trim().length > 10);
+                const globalPrices = Array.from(document.querySelectorAll(".a-price .a-offscreen"))
+                    .map(el => parseFloat(el.textContent.trim().replace(/[^0-9.]/g, "")))
+                    .filter(p => !isNaN(p) && p > 0);
+                conLog(`  global titles: ${globalTitles.length}, global prices: ${globalPrices.length}`);
+                if (globalTitles.length > 0 && globalPrices.length > 0 && globalTitles.length === globalPrices.length) {
+                    const positionalMap = {};
+                    globalTitles.forEach((el, i) => {
+                        const name = normalizeItemName(el.textContent.trim());
+                        if (name) positionalMap[name] = globalPrices[i];
+                    });
+                    if (Object.keys(positionalMap).length > 0) return positionalMap;
+                }
+                return {}; // containers found but no pairs
+            }
+            return null; // no containers
+        };
+
+        const interval = setInterval(() => {
+            attempts++;
+            const result = tryExtract();
+
+            if (result === null) {
+                // No containers yet — keep waiting
+                if (attempts >= maxAttempts) {
+                    clearInterval(interval);
+                    conError(`extractAndCachePrices: no item containers found for ${orderId} after ${attempts} attempts`);
+                    conLog(`  Page title: "${document.title}"`);
+                    conLog(`  .a-price elements anywhere: ${document.querySelectorAll(".a-price").length}`);
+                    // Clear the pending ping so the opener doesn't wait indefinitely
                     try {
                         const cache = JSON.parse(localStorage.getItem(PRICE_CACHE_KEY) || "{}");
-                        cache[orderId] = priceMap;
+                        if (cache[orderId] && cache[orderId]._pending) delete cache[orderId];
                         localStorage.setItem(PRICE_CACHE_KEY, JSON.stringify(cache));
-                        conLog(`extractAndCachePrices: cached ${count} item prices for order ${orderId}`);
-                    } catch (e) {
-                        conError("extractAndCachePrices: failed to write cache", e);
-                    }
-                } else {
-                    conError(`extractAndCachePrices: found containers but no name+price pairs for ${orderId}`);
+                    } catch (e) { /* ignore */ }
                 }
+                return;
+            }
+
+            clearInterval(interval);
+            const count = Object.keys(result).length;
+            if (count > 0) {
+                try {
+                    const cache = JSON.parse(localStorage.getItem(PRICE_CACHE_KEY) || "{}");
+                    cache[orderId] = result;
+                    localStorage.setItem(PRICE_CACHE_KEY, JSON.stringify(cache));
+                    conLog(`extractAndCachePrices: cached ${count} item prices for order ${orderId}`);
+                } catch (e) {
+                    conError("extractAndCachePrices: failed to write cache", e);
+                }
+            } else {
+                conError(`extractAndCachePrices: found containers but no name+price pairs for ${orderId}`);
+                // Clear pending ping
+                try {
+                    const cache = JSON.parse(localStorage.getItem(PRICE_CACHE_KEY) || "{}");
+                    if (cache[orderId] && cache[orderId]._pending) delete cache[orderId];
+                    localStorage.setItem(PRICE_CACHE_KEY, JSON.stringify(cache));
+                } catch (e) { /* ignore */ }
             }
         }, 500);
     };
