@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Amazon Order Exporter
-// @version      0.4.6
+// @version      0.4.7
 // @description  Export Amazon order history to JSON/CSV
 // @author       IeuanK
 // @url          https://github.com/IeuanK/AmazonExporter/raw/main/AmazonExporter.user.js
@@ -197,19 +197,91 @@
 
     const PRICE_CACHE_KEY = "amazonOrderPriceCache";
 
-    // Read cached prices for an order (written by extractAndCachePrices on the detail page).
-    const fetchItemPrices = async (orderId) => {
-        try {
-            const cache = JSON.parse(localStorage.getItem(PRICE_CACHE_KEY) || "{}");
-            if (cache[orderId] && Object.keys(cache[orderId]).length > 0) {
-                conLog(`fetchItemPrices ${orderId}: using cached prices (${Object.keys(cache[orderId]).length} items)`);
-                return cache[orderId];
-            }
-        } catch (e) {
-            conError("fetchItemPrices: cache read error", e);
-        }
-        conLog(`fetchItemPrices ${orderId}: no cached prices — visit the order detail page to cache item prices`);
-        return null;
+    // Load a detail page in a hidden same-origin iframe, wait for JS to render item rows,
+    // extract name→price pairs, cache in localStorage, and resolve with the map.
+    // Falls back to null if Amazon blocks iframes or items don't render within 15s.
+    const fetchItemPrices = (orderId) => {
+        return new Promise((resolve) => {
+            // Serve from cache when available
+            try {
+                const cache = JSON.parse(localStorage.getItem(PRICE_CACHE_KEY) || "{}");
+                if (cache[orderId] && Object.keys(cache[orderId]).length > 0) {
+                    conLog(`fetchItemPrices ${orderId}: cached (${Object.keys(cache[orderId]).length} items)`);
+                    return resolve(cache[orderId]);
+                }
+            } catch (e) { /* ignore */ }
+
+            const host = window.location.hostname;
+            const url = `https://${host}/your-orders/order-details?orderID=${orderId}`;
+
+            const iframe = document.createElement("iframe");
+            iframe.style.cssText = "position:fixed;width:1px;height:1px;top:-9999px;left:-9999px;border:none;visibility:hidden;";
+            document.body.appendChild(iframe);
+
+            let attempts = 0;
+            const maxAttempts = 30; // 15 seconds at 500ms intervals
+
+            const cleanup = (result) => {
+                clearInterval(poll);
+                iframe.remove();
+                resolve(result);
+            };
+
+            const poll = setInterval(() => {
+                attempts++;
+                try {
+                    const doc = iframe.contentDocument;
+                    if (!doc || !doc.body) {
+                        if (attempts >= maxAttempts) {
+                            conError(`fetchItemPrices ${orderId}: iframe timed out waiting for document`);
+                            cleanup(null);
+                        }
+                        return;
+                    }
+
+                    const containers = doc.querySelectorAll(".a-row.a-spacing-mini");
+                    if (!containers.length) {
+                        if (attempts >= maxAttempts) {
+                            conError(`fetchItemPrices ${orderId}: item rows never rendered in iframe`);
+                            cleanup(null);
+                        }
+                        return;
+                    }
+
+                    const priceMap = {};
+                    containers.forEach(container => {
+                        const titleEl = container.querySelector(".yohtmlc-product-title, .a-link-normal");
+                        if (!titleEl) return;
+                        const name = normalizeItemName(titleEl.textContent.trim());
+                        const priceEl = container.querySelector(".a-price .a-offscreen, .a-color-price");
+                        if (!priceEl) return;
+                        const price = parseFloat(priceEl.textContent.trim().replace(/[^0-9.]/g, ""));
+                        if (!isNaN(price) && name) priceMap[name] = price;
+                    });
+
+                    const count = Object.keys(priceMap).length;
+                    conLog(`fetchItemPrices ${orderId}: ${count} prices via iframe`);
+
+                    if (count > 0) {
+                        try {
+                            const cache = JSON.parse(localStorage.getItem(PRICE_CACHE_KEY) || "{}");
+                            cache[orderId] = priceMap;
+                            localStorage.setItem(PRICE_CACHE_KEY, JSON.stringify(cache));
+                        } catch (e) { /* ignore */ }
+                        cleanup(priceMap);
+                    } else {
+                        cleanup(null);
+                    }
+
+                } catch (e) {
+                    // SecurityError — Amazon's CSP is blocking iframe DOM access
+                    conError(`fetchItemPrices ${orderId}: iframe blocked by CSP (${e.message})`);
+                    cleanup(null);
+                }
+            }, 500);
+
+            iframe.src = url;
+        });
     };
 
     // Runs on /your-orders/order-details pages. Polls for JS-rendered item rows,
