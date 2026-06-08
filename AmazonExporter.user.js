@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Amazon Order Exporter
-// @version      0.4.7
+// @version      0.4.8
 // @description  Export Amazon order history to JSON/CSV
 // @author       IeuanK
 // @url          https://github.com/IeuanK/AmazonExporter/raw/main/AmazonExporter.user.js
@@ -197,9 +197,14 @@
 
     const PRICE_CACHE_KEY = "amazonOrderPriceCache";
 
-    // Load a detail page in a hidden same-origin iframe, wait for JS to render item rows,
+    // Shared popup window reused across all orders in one capture run.
+    // window.open() (unlike iframe) gives Amazon's JS full execution rights —
+    // item rows render normally, and the opener can read same-origin DOM directly.
+    let _priceWindow = null;
+
+    // Open the detail page in a shared popup, wait for JS-rendered item rows,
     // extract name→price pairs, cache in localStorage, and resolve with the map.
-    // Falls back to null if Amazon blocks iframes or items don't render within 15s.
+    // Falls back to null if the popup is blocked or items don't render within 20s.
     const fetchItemPrices = (orderId) => {
         return new Promise((resolve) => {
             // Serve from cache when available
@@ -214,27 +219,38 @@
             const host = window.location.hostname;
             const url = `https://${host}/your-orders/order-details?orderID=${orderId}`;
 
-            const iframe = document.createElement("iframe");
-            iframe.style.cssText = "position:fixed;width:1px;height:1px;top:-9999px;left:-9999px;border:none;visibility:hidden;";
-            document.body.appendChild(iframe);
+            // Reuse the named popup so the browser only needs to allow one popup per capture run.
+            // window.open() on an existing named window navigates it instead of opening a new one.
+            _priceWindow = window.open(url, "amazonPriceLookup", "width=900,height=700,left=50,top=50");
+
+            if (!_priceWindow) {
+                conError(`fetchItemPrices ${orderId}: popup was blocked — allow popups from amazon.com and retry`);
+                return resolve(null);
+            }
 
             let attempts = 0;
-            const maxAttempts = 30; // 15 seconds at 500ms intervals
-
-            const cleanup = (result) => {
-                clearInterval(poll);
-                iframe.remove();
-                resolve(result);
-            };
+            const maxAttempts = 40; // 20 seconds at 500ms intervals
 
             const poll = setInterval(() => {
                 attempts++;
                 try {
-                    const doc = iframe.contentDocument;
+                    const doc = _priceWindow.document;
+                    // During navigation doc.body may be null or for a different URL
                     if (!doc || !doc.body) {
                         if (attempts >= maxAttempts) {
-                            conError(`fetchItemPrices ${orderId}: iframe timed out waiting for document`);
-                            cleanup(null);
+                            clearInterval(poll);
+                            conError(`fetchItemPrices ${orderId}: popup timed out waiting for document`);
+                            resolve(null);
+                        }
+                        return;
+                    }
+
+                    // Sentinel: don't parse until the correct order's page has loaded
+                    if (!doc.body.textContent.includes(orderId)) {
+                        if (attempts >= maxAttempts) {
+                            clearInterval(poll);
+                            conError(`fetchItemPrices ${orderId}: orderId never appeared in popup document`);
+                            resolve(null);
                         }
                         return;
                     }
@@ -242,11 +258,14 @@
                     const containers = doc.querySelectorAll(".a-row.a-spacing-mini");
                     if (!containers.length) {
                         if (attempts >= maxAttempts) {
-                            conError(`fetchItemPrices ${orderId}: item rows never rendered in iframe`);
-                            cleanup(null);
+                            clearInterval(poll);
+                            conError(`fetchItemPrices ${orderId}: item rows never rendered in popup`);
+                            resolve(null);
                         }
                         return;
                     }
+
+                    clearInterval(poll);
 
                     const priceMap = {};
                     containers.forEach(container => {
@@ -260,7 +279,7 @@
                     });
 
                     const count = Object.keys(priceMap).length;
-                    conLog(`fetchItemPrices ${orderId}: ${count} prices via iframe`);
+                    conLog(`fetchItemPrices ${orderId}: ${count} prices via popup`);
 
                     if (count > 0) {
                         try {
@@ -268,19 +287,17 @@
                             cache[orderId] = priceMap;
                             localStorage.setItem(PRICE_CACHE_KEY, JSON.stringify(cache));
                         } catch (e) { /* ignore */ }
-                        cleanup(priceMap);
+                        resolve(priceMap);
                     } else {
-                        cleanup(null);
+                        resolve(null);
                     }
 
                 } catch (e) {
-                    // SecurityError — Amazon's CSP is blocking iframe DOM access
-                    conError(`fetchItemPrices ${orderId}: iframe blocked by CSP (${e.message})`);
-                    cleanup(null);
+                    clearInterval(poll);
+                    conError(`fetchItemPrices ${orderId}: popup DOM access error (${e.message})`);
+                    resolve(null);
                 }
             }, 500);
-
-            iframe.src = url;
         });
     };
 
@@ -577,6 +594,12 @@
 
             // Small delay to prevent UI freezing
             await new Promise(resolve => setTimeout(resolve, 50));
+        }
+
+        // Close the shared price-lookup popup once all orders are processed
+        if (_priceWindow && !_priceWindow.closed) {
+            _priceWindow.close();
+            _priceWindow = null;
         }
 
         const allOrders = { ...state.orders, ...newOrders };
