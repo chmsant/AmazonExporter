@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Amazon Order Exporter
-// @version      0.4.3
+// @version      0.4.4
 // @description  Export Amazon order history to JSON/CSV
 // @author       IeuanK
 // @url          https://github.com/IeuanK/AmazonExporter/raw/main/AmazonExporter.user.js
@@ -12,7 +12,7 @@
 // @match        https://www.amazon.co.uk/*
 // @match        https://www.amazon.nl/*
 // @grant        none
-// @require      https://cdnjs.cloudflare.com/ajax/libs/moment.js/2.29.4/moment.min.js
+// @require      https://cdnjs.cloudflare.com/ajax/libs/moment.js/2.29.4/moment.min.js#sha256=CBc3mFM1r0vhX8Z27UzMBwPHRGxrXLyTF+QLzcZCjl0=
 // ==/UserScript==
 
 (function () {
@@ -39,7 +39,17 @@
     const loadState = () => {
         const saved = localStorage.getItem(STATE_KEY);
         if (saved) {
-            state = JSON.parse(saved);
+            try {
+                const parsed = JSON.parse(saved);
+                // Validate expected shape before accepting
+                if (parsed && typeof parsed === "object" && typeof parsed.orders === "object") {
+                    state = parsed;
+                } else {
+                    conError("Ignoring malformed state in localStorage");
+                }
+            } catch (e) {
+                conError("Failed to parse state from localStorage:", e);
+            }
         }
         return state;
     };
@@ -109,7 +119,12 @@
                 order.totalPrice,
                 order.currency,
                 order.items.length
-            ].map(value => `"${value}"`)); // Wrap in quotes to handle commas in text
+            ].map(value => {
+                // Prefix formula-injection characters so spreadsheets treat the cell as text
+                const str = String(value);
+                const escaped = /^[=+\-@\t\r]/.test(str) ? `'${str}` : str;
+                return `"${escaped.replace(/"/g, '""')}"`;
+            }));
         });
 
         return [headers.join(","), ...rows.map(row => row.join(","))].join("\n");
@@ -654,11 +669,15 @@
         `;
 
         const state = loadState();
-        info.innerHTML = `
-            <div style="min-height: 20px">Total Orders: ${state.total || ""}</div>
-            <div style="min-height: 20px">Pages Captured: ${state.captures || ""}</div>
-            <div style="min-height: 20px">Last Update: ${state.lastUpdate || ""}</div>
-        `;
+        const makeInfoRow = (label, value) => {
+            const row = document.createElement("div");
+            row.style.minHeight = "20px";
+            row.textContent = `${label}: ${value || ""}`;
+            return row;
+        };
+        info.appendChild(makeInfoRow("Total Orders", state.total));
+        info.appendChild(makeInfoRow("Pages Captured", state.captures));
+        info.appendChild(makeInfoRow("Last Update", state.lastUpdate));
         panel.appendChild(info);
 
         // Add status span for capture progress
