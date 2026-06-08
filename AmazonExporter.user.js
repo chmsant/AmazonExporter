@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Amazon Order Exporter
-// @version      0.4.8
+// @version      0.4.9
 // @description  Export Amazon order history to JSON/CSV
 // @author       IeuanK
 // @url          https://github.com/IeuanK/AmazonExporter/raw/main/AmazonExporter.user.js
@@ -198,13 +198,12 @@
     const PRICE_CACHE_KEY = "amazonOrderPriceCache";
 
     // Shared popup window reused across all orders in one capture run.
-    // window.open() (unlike iframe) gives Amazon's JS full execution rights —
-    // item rows render normally, and the opener can read same-origin DOM directly.
     let _priceWindow = null;
 
-    // Open the detail page in a shared popup, wait for JS-rendered item rows,
-    // extract name→price pairs, cache in localStorage, and resolve with the map.
-    // Falls back to null if the popup is blocked or items don't render within 20s.
+    // Open the detail page in a popup tab. The userscript runs in that tab too and calls
+    // extractAndCachePrices(), which writes name→price pairs to localStorage. The opener
+    // polls localStorage until the entry appears, then resolves. No cross-frame DOM access.
+    // Falls back to null if the popup is blocked or prices don't cache within 20s.
     const fetchItemPrices = (orderId) => {
         return new Promise((resolve) => {
             // Serve from cache when available
@@ -219,8 +218,8 @@
             const host = window.location.hostname;
             const url = `https://${host}/your-orders/order-details?orderID=${orderId}`;
 
-            // Reuse the named popup so the browser only needs to allow one popup per capture run.
-            // window.open() on an existing named window navigates it instead of opening a new one.
+            // Reuse the named popup — window.open() on an existing named window navigates it
+            // rather than opening a new one, so only one popup permission is needed per capture.
             _priceWindow = window.open(url, "amazonPriceLookup", "width=900,height=700,left=50,top=50");
 
             if (!_priceWindow) {
@@ -231,70 +230,22 @@
             let attempts = 0;
             const maxAttempts = 40; // 20 seconds at 500ms intervals
 
+            // Poll localStorage — the userscript running in the popup writes the cache entry
             const poll = setInterval(() => {
                 attempts++;
                 try {
-                    const doc = _priceWindow.document;
-                    // During navigation doc.body may be null or for a different URL
-                    if (!doc || !doc.body) {
-                        if (attempts >= maxAttempts) {
-                            clearInterval(poll);
-                            conError(`fetchItemPrices ${orderId}: popup timed out waiting for document`);
-                            resolve(null);
-                        }
+                    const cache = JSON.parse(localStorage.getItem(PRICE_CACHE_KEY) || "{}");
+                    if (cache[orderId] && Object.keys(cache[orderId]).length > 0) {
+                        clearInterval(poll);
+                        conLog(`fetchItemPrices ${orderId}: ${Object.keys(cache[orderId]).length} prices via popup→localStorage`);
+                        resolve(cache[orderId]);
                         return;
                     }
+                } catch (e) { /* ignore */ }
 
-                    // Sentinel: don't parse until the correct order's page has loaded
-                    if (!doc.body.textContent.includes(orderId)) {
-                        if (attempts >= maxAttempts) {
-                            clearInterval(poll);
-                            conError(`fetchItemPrices ${orderId}: orderId never appeared in popup document`);
-                            resolve(null);
-                        }
-                        return;
-                    }
-
-                    const containers = doc.querySelectorAll(".a-row.a-spacing-mini");
-                    if (!containers.length) {
-                        if (attempts >= maxAttempts) {
-                            clearInterval(poll);
-                            conError(`fetchItemPrices ${orderId}: item rows never rendered in popup`);
-                            resolve(null);
-                        }
-                        return;
-                    }
-
+                if (attempts >= maxAttempts) {
                     clearInterval(poll);
-
-                    const priceMap = {};
-                    containers.forEach(container => {
-                        const titleEl = container.querySelector(".yohtmlc-product-title, .a-link-normal");
-                        if (!titleEl) return;
-                        const name = normalizeItemName(titleEl.textContent.trim());
-                        const priceEl = container.querySelector(".a-price .a-offscreen, .a-color-price");
-                        if (!priceEl) return;
-                        const price = parseFloat(priceEl.textContent.trim().replace(/[^0-9.]/g, ""));
-                        if (!isNaN(price) && name) priceMap[name] = price;
-                    });
-
-                    const count = Object.keys(priceMap).length;
-                    conLog(`fetchItemPrices ${orderId}: ${count} prices via popup`);
-
-                    if (count > 0) {
-                        try {
-                            const cache = JSON.parse(localStorage.getItem(PRICE_CACHE_KEY) || "{}");
-                            cache[orderId] = priceMap;
-                            localStorage.setItem(PRICE_CACHE_KEY, JSON.stringify(cache));
-                        } catch (e) { /* ignore */ }
-                        resolve(priceMap);
-                    } else {
-                        resolve(null);
-                    }
-
-                } catch (e) {
-                    clearInterval(poll);
-                    conError(`fetchItemPrices ${orderId}: popup DOM access error (${e.message})`);
+                    conError(`fetchItemPrices ${orderId}: timed out waiting for popup to cache prices`);
                     resolve(null);
                 }
             }, 500);
