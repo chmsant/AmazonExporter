@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Amazon Order Exporter
-// @version      0.4.4
+// @version      0.4.5
 // @description  Export Amazon order history to JSON/CSV
 // @author       IeuanK
 // @url          https://github.com/IeuanK/AmazonExporter/raw/main/AmazonExporter.user.js
@@ -102,7 +102,7 @@
         if (orders.length === 0) return "";
 
         // Headers
-        const headers = ["OrderId", "Date", "Payee", "Notes", "Total", "Currency", "ItemCount"];
+        const headers = ["OrderId", "Date", "Payee", "Notes", "Total", "Currency", "ItemCount", "Items"];
 
         // Create rows
         const rows = [];
@@ -118,7 +118,13 @@
                 `${order.orderId} - ${itemNotes}`,
                 order.totalPrice,
                 order.currency,
-                order.items.length
+                order.items.length,
+                JSON.stringify(order.items.map(i => ({
+                    name: i.name,
+                    qty: i.qty,
+                    unitPrice: i.unitPrice ?? null,
+                    status: i.status,
+                }))),
             ].map(value => {
                 // Prefix formula-injection characters so spreadsheets treat the cell as text
                 const str = String(value);
