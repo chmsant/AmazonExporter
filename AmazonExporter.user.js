@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Amazon Order Exporter
-// @version      0.4.11
+// @version      0.4.12
 // @description  Export Amazon order history to JSON/CSV
 // @author       IeuanK
 // @url          https://github.com/IeuanK/AmazonExporter/raw/main/AmazonExporter.user.js
@@ -220,8 +220,15 @@
         try {
             const cache = JSON.parse(localStorage.getItem(PRICE_CACHE_KEY) || "{}");
             cache[orderId] = priceMap;
+            // Evict oldest entries if cache exceeds 500 orders to prevent QuotaExceededError
+            const keys = Object.keys(cache);
+            if (keys.length > 500) {
+                keys.slice(0, keys.length - 500).forEach(k => delete cache[k]);
+            }
             localStorage.setItem(PRICE_CACHE_KEY, JSON.stringify(cache));
-        } catch (e) { /* ignore */ }
+        } catch (e) {
+            conError("savePriceCache: failed to write price cache:", e.message);
+        }
     };
 
     // Fetch the order detail page and extract item prices.
@@ -345,7 +352,7 @@
         const month = isPart1Day ? part2 : part1; // The other part becomes the month
 
         // Attempt to create a Date object using the current year (assume 2024 for now)
-        const dateString = `${month} ${day} 2024`; // Month-Day-Year format
+        const dateString = `${month} ${day} ${new Date().getFullYear()}`;
         const dateObj = new Date(dateString);
 
         if (!dateObj) {
@@ -476,10 +483,10 @@
                     }
 
                     const statusText = statusElem.textContent.trim();
-                    const [status, dateStr] = statusText.split(" ").filter(Boolean);
+                    const [status] = statusText.split(" ").filter(Boolean);
 
                     let formattedStatusDate = null;
-                    if(statusText.indexOf('today') > -1) {
+                    if (statusText.indexOf('today') > -1) {
                         let today = new Date();
                         formattedStatusDate = `${(today.getMonth() + 1).toString().padStart(2, "0")}-${today.getDate().toString().padStart(2, "0")}`;
                     } else if (statusText.indexOf('tomorrow') > -1) {
@@ -491,22 +498,14 @@
                         yesterday.setDate(yesterday.getDate() - 1);
                         formattedStatusDate = `${(yesterday.getMonth() + 1).toString().padStart(2, "0")}-${yesterday.getDate().toString().padStart(2, "0")}`;
                     } else {
-                        // Format date as MM-DD
-                        const statusDateParts = statusText.split(" ").filter(Boolean); // Split and clean up text
-                        const deliveryStatus = statusDateParts[0]; // First part is always the status (e.g., "Delivered")
-
-// Extract potential day and month values
+                        const statusDateParts = statusText.split(" ").filter(Boolean);
                         const possibleDay = statusDateParts[1];
                         const possibleMonth = statusDateParts[2];
-
-// Use a helper method to parse the date properly
-                        let formattedStatusDate = "";
                         if (possibleDay && possibleMonth) {
                             formattedStatusDate = formatDateFromParts(possibleDay, possibleMonth);
                         } else {
-                            console.warn("Could not extract delivery date properly from status:", statusText);
+                            conError("Could not extract delivery date from status:", statusText);
                         }
-
                     }
 
                     // Process each item in this delivery - try both old and new item selectors
@@ -788,7 +787,7 @@
 
     const createButton = (icon, tooltip, onClick) => {
         const button = document.createElement("button");
-        button.innerHTML = icon;
+        button.textContent = icon;
         button.title = tooltip;
         button.style.cssText = `
             margin: 5px;
