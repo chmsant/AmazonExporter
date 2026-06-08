@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Amazon Order Exporter
-// @version      0.4.12
+// @version      0.4.13
 // @description  Export Amazon order history to JSON/CSV
 // @author       IeuanK
 // @url          https://github.com/IeuanK/AmazonExporter/raw/main/AmazonExporter.user.js
@@ -193,7 +193,39 @@
     };
 
     const normalizeItemName = (name) =>
-        name.toLowerCase().replace(/\s+/g, " ").trim();
+        name.toLowerCase()
+            .replace(/[–—]/g, "-")   // en-dash, em-dash → hyphen
+            .replace(/[‘’]/g, "'")   // smart single quotes → straight
+            .replace(/[“”]/g, '"')   // smart double quotes → straight
+            .replace(/\s+/g, " ")
+            .trim();
+
+    // Match a listing-page name against a priceMap from the detail page.
+    // 1. Exact normalized match.
+    // 2. Prefix match — handles titles truncated differently on listing vs detail page.
+    // 3. Word-overlap match — ≥60% of the shorter name's words appear in the longer name.
+    const findPriceMatch = (name, priceMap) => {
+        const key = normalizeItemName(name);
+        if (key in priceMap) return priceMap[key];
+
+        // Prefix match: one name starts with the other
+        for (const [mapKey, price] of Object.entries(priceMap)) {
+            if (key.startsWith(mapKey) || mapKey.startsWith(key)) return price;
+        }
+
+        // Word-overlap match
+        const keyWords = new Set(key.split(" ").filter(w => w.length > 2));
+        let bestScore = 0, bestPrice = null;
+        for (const [mapKey, price] of Object.entries(priceMap)) {
+            const mapWords = mapKey.split(" ").filter(w => w.length > 2);
+            const overlap = mapWords.filter(w => keyWords.has(w)).length;
+            const score = overlap / Math.max(keyWords.size, mapWords.length);
+            if (score > bestScore) { bestScore = score; bestPrice = price; }
+        }
+        if (bestScore >= 0.6) return bestPrice;
+
+        return null;
+    };
 
     const PRICE_CACHE_KEY = "amazonOrderPriceCache";
 
@@ -525,10 +557,27 @@
                 if (items.length > 1) {
                     const priceMap = await fetchItemPrices(orderId);
                     if (priceMap) {
+                        // Track which priceMap entries have been claimed to enable positional fallback
+                        const claimed = new Set();
                         items.forEach(item => {
-                            const key = normalizeItemName(item.name);
-                            if (key in priceMap) item.unitPrice = priceMap[key];
+                            const price = findPriceMatch(item.name, priceMap);
+                            if (price !== null) {
+                                item.unitPrice = price;
+                                // Mark matched key as claimed
+                                for (const k of Object.keys(priceMap)) {
+                                    if (priceMap[k] === price && !claimed.has(k)) { claimed.add(k); break; }
+                                }
+                            }
                         });
+
+                        // Positional fallback: if exactly one item is still unpriced and
+                        // exactly one price is unclaimed, they must be the pair
+                        const unpriced = items.filter(i => i.unitPrice === null);
+                        const unclaimed = Object.entries(priceMap).filter(([k]) => !claimed.has(k));
+                        if (unpriced.length === 1 && unclaimed.length === 1) {
+                            unpriced[0].unitPrice = unclaimed[0][1];
+                            conLog(`fetchItemPrices ${orderId}: positional fallback assigned ${unclaimed[0][1]} to unmatched item`);
+                        }
                     }
                     // 300ms delay between detail fetches to reduce bot-detection risk
                     await new Promise(resolve => setTimeout(resolve, 300));
